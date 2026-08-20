@@ -1,0 +1,226 @@
+---
+title: "Bulk RNAseq Analysis Report"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 8
+    fig_height: 5
+params:
+  counts_file:   "counts.csv"
+  meta_file:     "metadata.csv"
+  filter_by_type: true
+  gene_types:    !r c("protein_coding", "lincRNA")
+  min_cpm:       0.5
+  min_samples:   2
+  group_col:     "Group"
+  group_a:       "Treatment"
+  group_b:       "Control"
+  fdr:           0.05
+  lfc:           1
+  pca_color_by:  "Group"
+  pca_shape_by:  null
+  hm_ann_cols:   !r c("Group")
+  hm_n_genes:    50
+  genes_of_interest: !r c()
+  bp_x_by:       "Group"
+  bp_facet_by:   null
+  bp_color_by:   "Group"
+  run_gsea:      false
+  gmt_file:      null
+  gsea_pval:     0.05
+  run_ora:       false
+  ora_species:   "mouse"
+  ora_ont:       "BP"
+  species:       "mouse"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+source("R/functions.R")
+p <- params
+```
+
+---
+
+## 1. Data Loading & Filtering
+
+```{r load}
+dge <- load_and_filter(
+  p$counts_file, p$meta_file,
+  gene_types     = p$gene_types,
+  filter_by_type = p$filter_by_type,
+  min_cpm        = p$min_cpm,
+  min_samples    = p$min_samples
+)
+log2cpm <- make_log2cpm(dge)
+meta    <- dge$samples
+```
+
+```{r load-summary}
+knitr::kable(data.frame(
+  Metric = c("Genes retained", "Samples", "CPM filter", "Min samples", "Normalisation"),
+  Value  = c(nrow(dge), ncol(dge), p$min_cpm, p$min_samples, "TMM")
+), caption = "Filtering summary")
+```
+
+**Metadata:**
+```{r meta-table}
+knitr::kable(meta)
+```
+
+---
+
+## 2. Quality Control
+
+### Library Size
+
+```{r qc-libsize, fig.height=4}
+plot_library_size(dge, color_by = p$group_col)
+```
+
+### Expression Density
+
+```{r qc-density, fig.height=4}
+plot_density(dge, color_by = p$group_col)
+```
+
+---
+
+## 3. PCA
+
+```{r pca, fig.height=5}
+plot_pca(log2cpm, meta,
+         color_by = p$pca_color_by,
+         shape_by = p$pca_shape_by,
+         n_genes  = 2500)
+```
+
+---
+
+## 4. Differential Expression: `r p$group_a` vs `r p$group_b`
+
+```{r de}
+de <- run_DE(dge, p$group_col, p$group_a, p$group_b,
+             fdr = p$fdr, lfc = p$lfc)
+```
+
+**Summary:** `r nrow(de$up)` up-regulated, `r nrow(de$down)` down-regulated
+(FDR < `r p$fdr`, |log2FC| > `r p$lfc`).
+
+### Volcano Plot
+
+```{r volcano, fig.height=5}
+plot_volcano(de, fdr = p$fdr, lfc = p$lfc)
+```
+
+### MA Plot
+
+```{r ma, fig.height=5}
+plot_ma(de, fdr = p$fdr, lfc = p$lfc)
+```
+
+### Top DE Genes
+
+```{r de-table}
+top_tab <- head(de$all[order(de$all$FDR), ], 30)
+knitr::kable(top_tab[, setdiff(colnames(top_tab), "genes")],
+             digits = 4, caption = "Top 30 DE genes by FDR")
+```
+
+---
+
+## 5. Heatmap — Top DE Genes
+
+```{r heatmap, fig.height=7}
+hm_genes <- rownames(head(de$sig[order(de$sig$FDR), ], p$hm_n_genes))
+if (length(hm_genes) > 1) {
+  hm <- plot_heatmap(log2cpm, hm_genes, meta,
+                     ann_cols     = p$hm_ann_cols,
+                     cluster_rows = TRUE,
+                     cluster_cols = FALSE,
+                     scale        = "row")
+  grid::grid.newpage()
+  grid::grid.draw(hm$gtable)
+} else {
+  cat("Fewer than 2 significant genes — heatmap skipped.")
+}
+```
+
+---
+
+```{r boxplots-section, results='asis', eval=length(p$genes_of_interest) > 0}
+cat("## 6. Boxplots — Genes of Interest\n\n")
+```
+
+```{r boxplots, fig.height=5, eval=length(p$genes_of_interest) > 0}
+facet_by <- if (!is.null(p$bp_facet_by) && nchar(p$bp_facet_by) > 0) p$bp_facet_by else NULL
+plot_boxplots(log2cpm, meta,
+              genes    = p$genes_of_interest,
+              x_by     = p$bp_x_by,
+              color_by = p$bp_color_by,
+              facet_by = facet_by)
+```
+
+---
+
+```{r gsea-section, results='asis', eval=p$run_gsea && !is.null(p$gmt_file)}
+cat("## 7. GSEA\n\n")
+```
+
+```{r gsea, eval=p$run_gsea && !is.null(p$gmt_file)}
+# Convert if needed
+de_for_path <- de
+log2cpm_for_path <- log2cpm
+
+if (p$species == "mouse2human") {
+  conv <- convert_mouse_human(rownames(log2cpm_for_path))
+  if (!is.null(conv) && length(conv) > 0) {
+    log2cpm_for_path <- apply_human_symbols(log2cpm_for_path, conv)
+    common <- intersect(rownames(de_for_path$all), names(conv))
+    de_for_path$all <- de_for_path$all[common, ]
+    rownames(de_for_path$all) <- conv[common]
+  }
+}
+
+gsea_res <- run_gsea(de_for_path$all, p$gmt_file, pval = p$gsea_pval)
+if (!is.null(gsea_res$plot)) print(gsea_res$plot)
+knitr::kable(head(gsea_res$results[, c("pathway","NES","padj","dir")], 30),
+             digits = 4, caption = "Top GSEA pathways")
+```
+
+---
+
+```{r ora-section, results='asis', eval=p$run_ora}
+cat("## 8. ORA (Over-Representation Analysis)\n\n")
+```
+
+```{r ora, eval=p$run_ora}
+ora_res <- run_ora(de, species = p$ora_species, ont = p$ora_ont, pval = 0.05)
+
+for (nm in names(ora_res)) {
+  cat(sprintf("\n### %s\n\n", nm))
+  df <- as.data.frame(ora_res[[nm]])
+  if (nrow(df) > 0) {
+    if (requireNamespace("enrichplot", quietly = TRUE))
+      print(enrichplot::dotplot(ora_res[[nm]], showCategory = 15,
+                                 title = nm))
+    print(knitr::kable(head(df[, c("Description","GeneRatio","p.adjust","geneID")], 20),
+                       digits = 4))
+  } else {
+    cat("No significant terms.\n\n")
+  }
+}
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
